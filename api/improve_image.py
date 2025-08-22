@@ -3,7 +3,7 @@ from http.server import BaseHTTPRequestHandler
 import os, json, base64, io, cgi
 
 from openai import OpenAI
-client = OpenAI(api_key=os.environ.get("6fe1f651f3cf42841ecbb901f9bf2f4c873f626110506207066ff6cf71157e31"))
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 MAX_BYTES = 4_300_000  # keep under Vercel's 4.5MB body cap
 
