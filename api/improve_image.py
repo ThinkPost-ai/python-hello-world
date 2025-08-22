@@ -36,6 +36,21 @@ class handler(BaseHTTPRequestHandler):
             headers=self.headers,
             environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
         )
+        # inside do_POST, after parsing the multipart form
+        import requests, io
+        
+        if "image" in form:
+            img_bytes = form["image"].file.read()
+        elif "image_url" in form:
+            url = form["image_url"].value.strip()
+            try:
+                r = requests.get(url, timeout=15, stream=True)
+                r.raise_for_status()
+                img_bytes = r.content
+            except Exception as e:
+                return _json(self, 400, {"error": f"Could not fetch image_url: {e}"})
+        else:
+            return _json(self, 400, {"error": "Provide 'image' (file) or 'image_url' (URL)"})
 
         # Grab prompt + image
         if "prompt" not in form or "image" not in form:
