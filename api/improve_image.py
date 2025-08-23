@@ -20,7 +20,7 @@ class handler(BaseHTTPRequestHandler):
         # Simple health/info
         self.send_response(200)
         self.send_header("content-type", "application/json")
-        body = json.dumps({"ok": True, "usage": "POST multipart/form-data with fields: image (file), prompt (text) - edits images using gpt-image-1"}).encode("utf-8")
+        body = json.dumps({"ok": True, "usage": "POST multipart/form-data with fields: image (file), prompt (text) - improves images using GPT-4.1"}).encode("utf-8")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -63,18 +63,30 @@ class handler(BaseHTTPRequestHandler):
         bio.name = fileitem.filename or "upload.png"  # name hint helps the SDK
 
         try:
-            # Use gpt-image-1 for image editing with both image and prompt
-            result = client.images.edit(
-                model="gpt-image-1",
-                image=bio,
-                prompt=prompt,
-                size="1024x1024",
-                response_format="b64_json"
+            # Encode the uploaded image to base64 for GPT-4.1
+            image_base64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            # Create multimodal input for GPT-4.1 with both image and text
+            multimodal_input = f"data:image/jpeg;base64,{image_base64}\n\nUser request: {prompt}\n\nPlease generate an improved version of this image based on the user's request."
+            
+            # Use GPT-4.1 with responses.create for image generation based on input image + prompt
+            stream = client.responses.create(
+                model="gpt-4.1",
+                input=multimodal_input,
+                stream=True,
+                tools=[{"type": "image_generation", "partial_images": 1}],
             )
             
-            # Get the base64 encoded image from the response
-            image_base64 = result.data[0].b64_json
-            out_bytes = base64.b64decode(image_base64)
+            # Collect the generated image from the stream
+            out_bytes = None
+            for event in stream:
+                if event.type == "response.image_generation_call.partial_image":
+                    image_base64_output = event.partial_image_b64
+                    out_bytes = base64.b64decode(image_base64_output)
+                    break  # Take the first generated image
+            
+            if out_bytes is None:
+                return self._error(500, "No image generated from GPT-4.1")
                 
         except Exception as e:
             return self._error(500, f"OpenAI error: {str(e)}")
