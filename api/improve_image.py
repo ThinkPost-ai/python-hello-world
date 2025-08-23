@@ -20,7 +20,7 @@ class handler(BaseHTTPRequestHandler):
         # Simple health/info
         self.send_response(200)
         self.send_header("content-type", "application/json")
-        body = json.dumps({"ok": True, "usage": "POST multipart/form-data with field: prompt (text) - generates images using GPT-4.1"}).encode("utf-8")
+        body = json.dumps({"ok": True, "usage": "POST multipart/form-data with fields: image (file), prompt (text) - edits images using gpt-image-1"}).encode("utf-8")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -28,7 +28,7 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         ctype = self.headers.get("content-type", "")
         if not ctype.startswith("multipart/form-data"):
-            return self._error(415, "Use multipart/form-data with field: prompt (text)")
+            return self._error(415, "Use multipart/form-data with fields: image (file) and prompt (text)")
 
         # Parse multipart form
         form = cgi.FieldStorage(
@@ -36,33 +36,45 @@ class handler(BaseHTTPRequestHandler):
             headers=self.headers,
             environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
         )
-        # GPT-4.1 generates images from text prompts only
-
-        # Grab prompt (image is optional now since GPT-4.1 generates from text)
+        
+        # Handle image input (required for image editing)
+        if "image" not in form:
+            return self._error(400, "Missing 'image' field")
+        
+        # Handle prompt input (required for editing instructions)
         if "prompt" not in form:
             return self._error(400, "Missing 'prompt' field")
 
         prompt = form["prompt"].value
+        fileitem = form["image"]
 
         try:
-            # Use GPT-4.1 with responses.create for image generation
-            stream = client.responses.create(
-                model="gpt-4.1",
-                input=prompt,
-                stream=True,
-                tools=[{"type": "image_generation", "partial_images": 1}],
+            img_bytes = fileitem.file.read()
+        except Exception:
+            return self._error(400, "Could not read uploaded file")
+
+        if not img_bytes:
+            return self._error(400, "Empty image file")
+        if len(img_bytes) > MAX_BYTES:
+            return self._error(413, "Image too large for serverless payload limit (~4.5MB)")
+
+        # Wrap bytes as file-like object for OpenAI Images Edit
+        bio = io.BytesIO(img_bytes)
+        bio.name = fileitem.filename or "upload.png"  # name hint helps the SDK
+
+        try:
+            # Use gpt-image-1 for image editing with both image and prompt
+            result = client.images.edit(
+                model="gpt-image-1",
+                image=bio,
+                prompt=prompt,
+                size="1024x1024",
+                response_format="b64_json"
             )
             
-            # Collect the generated image from the stream
-            out_bytes = None
-            for event in stream:
-                if event.type == "response.image_generation_call.partial_image":
-                    image_base64 = event.partial_image_b64
-                    out_bytes = base64.b64decode(image_base64)
-                    break  # Take the first generated image
-            
-            if out_bytes is None:
-                return self._error(500, "No image generated from GPT-4.1")
+            # Get the base64 encoded image from the response
+            image_base64 = result.data[0].b64_json
+            out_bytes = base64.b64decode(image_base64)
                 
         except Exception as e:
             return self._error(500, f"OpenAI error: {str(e)}")
