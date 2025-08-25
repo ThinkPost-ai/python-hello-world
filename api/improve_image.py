@@ -1,126 +1,113 @@
-# api/improve_image.py  (route => /api/improve_image)
+# api/improve_image.py  -> route: /api/improve_image
 from http.server import BaseHTTPRequestHandler
-import os, json, base64
+import os, json, base64, logging, sys
+from cgi import parse_header
 
 from openai import OpenAI
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
+log = logging.getLogger("improve_image")
+
+def send_json(self, code, obj):
+    data = json.dumps(obj).encode("utf-8")
+    self.send_response(code)
+    self.send_header("content-type", "application/json")
+    self.send_header("content-length", str(len(data)))
+    # (Optional CORS; safe to leave for server-side callers too)
+    self.send_header("Access-Control-Allow-Origin", "*")
+    self.end_headers()
+    self.wfile.write(data)
+
 class handler(BaseHTTPRequestHandler):
-    def _set_cors_headers(self):
-        """Set CORS headers for all responses"""
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-
-    def _error(self, code: int, msg: str):
-        payload = json.dumps({"error": msg}).encode("utf-8")
-        self.send_response(code)
-        self.send_header("content-type", "application/json")
-        self._set_cors_headers()
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-        # Log the error for debugging
-        print(f"ERROR {code}: {msg}")
-
+    # For browser preflight (not required for curl, but handy)
     def do_OPTIONS(self):
-        """Handle preflight requests"""
-        self.send_response(200)
-        self._set_cors_headers()
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "content-type")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.end_headers()
 
     def do_GET(self):
-        # Simple health/info
-        print("GET request received")  # Debug log
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self._set_cors_headers()
-        body = json.dumps({
-            "ok": True, 
-            "usage": "POST JSON with fields: prompt (text), image_url (URL) - generates improved images using GPT-4.1 Responses API",
-            "example": {
-                "prompt": "Make this photo look like a professional Instagram advertisement",
-                "image_url": "https://example.com/image.jpg"
-            }
-        }).encode("utf-8")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        log.info("GET /api/improve_image")
+        send_json(self, 200, {
+            "ok": True,
+            "usage": "POST application/json with: { prompt: string, image_url: string }"
+        })
 
     def do_POST(self):
-        print("POST request received")  # Debug log
-        
-        # Check content type
-        ctype = self.headers.get("content-type", "")
-        print(f"Content-Type: {ctype}")  # Debug log
-        
-        if not ctype.startswith("application/json"):
-            return self._error(415, "Use application/json with fields: prompt (text) and image_url (URL)")
+        ctype_raw = self.headers.get("content-type", "")
+        clen = int(self.headers.get("content-length", "0") or 0)
+        main_type, _ = parse_header(ctype_raw)
+        log.info("POST /api/improve_image content-type=%r (main=%r) len=%d",
+                 ctype_raw, main_type, clen)
 
-        # Get content length and read request body
-        try:
-            content_length = int(self.headers.get('content-length', 0))
-            print(f"Content-Length: {content_length}")  # Debug log
-            post_data = self.rfile.read(content_length)
-            print(f"Raw data: {post_data[:200]}...")  # Debug log (first 200 chars)
-            data = json.loads(post_data.decode('utf-8'))
-            print(f"Parsed JSON: {data}")  # Debug log
-        except (ValueError, json.JSONDecodeError) as e:
-            return self._error(400, f"Invalid JSON payload: {str(e)}")
+        # Read the body once
+        body_bytes = self.rfile.read(clen) if clen else b""
+        body_text = body_bytes.decode("utf-8", "ignore").strip()
 
-        # Validate required fields
-        if "prompt" not in data:
-            return self._error(400, "Missing 'prompt' field")
-        if "image_url" not in data:
-            return self._error(400, "Missing 'image_url' field")
-
-        prompt = data["prompt"]
-        image_url = data["image_url"]
-        print(f"Processing request - Prompt: {prompt[:50]}..., Image URL: {image_url}")
+        # Accept JSON if either:
+        #  - main_type == application/json
+        #  - or body "looks like" JSON (starts with {)
+        if main_type != "application/json" and not body_text.startswith("{"):
+            return send_json(self, 415, {
+                "error": "Unsupported Media Type. Use application/json with {prompt, image_url}.",
+                "got_content_type": ctype_raw
+            })
 
         try:
-            # Build the multimodal input (text + image by URL) - same as Colab cell
-            content = [{"type": "input_text", "text": prompt}]
-            content.append({"type": "input_image", "image_url": image_url})
-            print("Making OpenAI API call...")
+            data = json.loads(body_text or "{}")
+        except json.JSONDecodeError:
+            return send_json(self, 400, {"error": "Invalid JSON payload"})
 
-            # Call the Responses API with the image_generation tool - same as Colab cell
+        # Validate
+        prompt = data.get("prompt")
+        image_url = data.get("image_url")
+        if not prompt:
+            return send_json(self, 400, {"error": "Missing 'prompt'"})
+        if not image_url:
+            return send_json(self, 400, {"error": "Missing 'image_url'"})
+
+        # Build multimodal content
+        content = [
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": image_url},
+        ]
+
+        try:
+            # Ask the Responses API to use the image_generation tool
             resp = client.responses.create(
                 model="gpt-4.1",
                 input=[{"role": "user", "content": content}],
                 tools=[{"type": "image_generation"}],
+                # You can force the tool if needed:
+                # tool_choice={"type":"tool","name":"image_generation"},
             )
-            print("OpenAI API call completed")
 
-            # Extract base64 image(s) from the tool output - same as Colab cell
-            image_b64_list = []
+            # Extract base64 image
+            image_b64 = None
             for item in getattr(resp, "output", []) or []:
-                # Newer SDKs return an "image_generation_call" with .result as base64
                 if getattr(item, "type", None) == "image_generation_call" and hasattr(item, "result"):
-                    image_b64_list.append(item.result)
-                    print("Found image_generation_call with result")
-                # In case the SDK returns image objects directly (future-proofing)
-                elif getattr(item, "type", None) == "image" and hasattr(item, "image_base64"):
-                    image_b64_list.append(item.image_base64)
-                    print("Found direct image object")
+                    image_b64 = item.result
+                    break
+                if getattr(item, "type", None) == "image" and hasattr(item, "image_base64"):
+                    image_b64 = item.image_base64
+                    break
 
-            if not image_b64_list:
-                print(f"No image found in response. Response structure: {resp}")
-                return self._error(500, "No image found in response")
+            if not image_b64:
+                # Helpful debug output in logs
+                log.warning("No image in response. Full resp: %s", resp)
+                return send_json(self, 500, {"error": "No image found in response"})
 
-            # Decode the base64 image
-            image_bytes = base64.b64decode(image_b64_list[0])
-            print(f"Successfully generated image of {len(image_bytes)} bytes")
+            image_bytes = base64.b64decode(image_b64)
+
+            self.send_response(200)
+            self.send_header("content-type", "image/png")
+            self.send_header("content-length", str(len(image_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(image_bytes)
 
         except Exception as e:
-            print(f"OpenAI API error: {str(e)}")  # Debug log
-            return self._error(500, f"OpenAI error: {str(e)}")
-
-        # Return the image bytes
-        self.send_response(200)
-        self.send_header("content-type", "image/png")
-        self._set_cors_headers()
-        self.send_header("content-length", str(len(image_bytes)))
-        self.end_headers()
-        self.wfile.write(image_bytes)
-        print("Response sent successfully")
+            log.exception("OpenAI call failed")
+            return send_json(self, 500, {"error": f"OpenAI error: {str(e)}"})
