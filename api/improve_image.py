@@ -115,39 +115,35 @@ class handler(BaseHTTPRequestHandler):
         size      = (data.get("size") or "1024x1024").strip()
         if not prompt:     return send_json(self, 400, {"error": "Missing 'prompt'"})
         if not image_url:  return send_json(self, 400, {"error": "Missing 'image_url'"})
-        if not prompt:     return send_json(self, 400, {"error": "Missing 'prompt'"})
-        if not image_url:  return send_json(self, 400, {"error": "Missing 'image_url'"})
+
 
         # 1) Ask the Responses API to run the image_generation tool (force PNG)
         image_b64 = None
 ## SECION
+## SECION
         try:
-            # Build multimodal input (text + image URL)
+            # Build multimodal input (text + image URL[s])
             content = [{"type": "input_text", "text": prompt}]
-            # Accept a single string or a list (if client ever sends an array)
-            urls = [u for u in ([image_url] if isinstance(image_url, str) else image_url) if u]
+            urls = [image_url] if isinstance(image_url, str) else (image_url or [])
             for u in urls:
-                content.append({"type": "input_image", "image_url": u})
+                if u:
+                    content.append({"type": "input_image", "image_url": u})
 
-            # Nudge the model to actually call the tool and produce a single PNG of the requested size
+            # Responses API with the built-in image_generation tool
+            # Force the tool to run and pass size via tool_config.
             resp = client.responses.create(
                 model="gpt-4.1",
-                input=[
-                    {
-                        "role": "system",
-                        "content": [{"type": "text",
-                                     "text": f"Use the image_generation tool to output exactly one {size} PNG. "
-                                             f'Return only the image as base64 (no text).'}]
-                    },
-                    {"role": "user", "content": content},
-                ],
+                input=[{"role": "user", "content": content}],
                 tools=[{"type": "image_generation"}],
+                tool_choice={"type": "image_generation"},  # <-- ensure the model actually calls it
+                tool_config={"image_generation": {"size": size}},  # <-- set output size
             )
 
-            # Extract base64 image from tool output (robust to SDK variations)
+            # Extract base64 image from the tool result (handle SDK variants)
             out_b64 = None
-            items = getattr(resp, "output", []) or []
-            for item in items:
+
+            # v1 SDK typically returns items in resp.output
+            for item in (getattr(resp, "output", []) or []):
                 t = getattr(item, "type", None)
                 if t == "image_generation_call" and hasattr(item, "result") and item.result:
                     out_b64 = item.result
@@ -155,7 +151,8 @@ class handler(BaseHTTPRequestHandler):
                 if t == "image" and hasattr(item, "image_base64") and item.image_base64:
                     out_b64 = item.image_base64
                     break
-                if hasattr(item, "content"):  # nested content fallback
+                # nested content fallback
+                if hasattr(item, "content"):
                     for sub in (item.content or []):
                         if getattr(sub, "type", None) == "image" and hasattr(sub, "image_base64"):
                             out_b64 = sub.image_base64
@@ -163,7 +160,7 @@ class handler(BaseHTTPRequestHandler):
                     if out_b64:
                         break
 
-            # Last-ditch: sometimes output_text may contain a data URL
+            # Last chance: sometimes output_text can contain a data URL
             if not out_b64:
                 possible = (getattr(resp, "output_text", "") or "").strip()
                 m = DATA_URL_RE.match(possible)
@@ -171,14 +168,30 @@ class handler(BaseHTTPRequestHandler):
                     out_b64 = m.group(2)
 
             if not out_b64:
-                log.error("No image found in response. Raw: %r", resp)
-                return send_json(self, 502, {"error": "no image in response"})
+                raise RuntimeError("no image in Responses output")
 
             image_b64 = out_b64
 
         except Exception as e:
+            # Bubble up useful details so you can see the real cause in the response
+            import traceback
+            err_msg = str(e)
+            tb = traceback.format_exc()
+            detail = {"error": "OpenAI call failed", "message": err_msg, "trace": tb}
+
+            # Try to extract structured fields the new SDK exposes on HTTP errors
+            try:
+                status = getattr(e, "status_code", None)
+                err_obj = getattr(e, "response", None)
+                if status is not None:
+                    detail["status_code"] = status
+                if err_obj is not None:
+                    detail["api_response"] = getattr(err_obj, "json", lambda: None)()
+            except Exception:
+                pass
+
             log.exception("OpenAI image generation failed")
-            return send_json(self, 500, {"error": f"OpenAI call failed: {e}"})
+            return send_json(self, 500, detail)
         # 3) Clean + decode the base64 (strip data URL if present)
         mime_hint, payload_b64 = _strip_data_url(image_b64)
         try:
