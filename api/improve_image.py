@@ -131,13 +131,30 @@ class handler(BaseHTTPRequestHandler):
 
             # Responses API with the built-in image_generation tool
             # Force the tool to run and pass size via tool_config.
-            resp = client.responses.create(
-                model="gpt-4.1",
-                input=[{"role": "user", "content": content}],
-                tools=[{"type": "image_generation"}],
-                tool_choice={"type": "image_generation"},  # <-- ensure the model actually calls it
-                tool_config={"image_generation": {"size": size}},  # <-- set output size
-            )
+            # --- Try with explicit tool_choice + size via extra_body (works on most 1.x SDKs)
+            try:
+                resp = client.responses.create(
+                    model="gpt-4.1",
+                    input=[{"role": "user", "content": content}],
+                    tools=[{"type": "image_generation"}],
+                    tool_choice={"type": "image_generation"},
+                    extra_body={  # older SDKs ignore unknown fields here
+                        "tool_config": {"image_generation": {"size": size}}
+                    },
+                )
+            except TypeError:
+                # Very old SDK: no extra_body/tool_choice support — push size via system message
+                resp = client.responses.create(
+                    model="gpt-4.1",
+                    input=[
+                        {"role": "system", "content": [
+                            {"type": "text",
+                             "text": f"When you call the image_generation tool, output exactly one {size} PNG and nothing else."}
+                        ]},
+                        {"role": "user", "content": content},
+                    ],
+                    tools=[{"type": "image_generation"}],
+                )
 
             # Extract base64 image from the tool result (handle SDK variants)
             out_b64 = None
