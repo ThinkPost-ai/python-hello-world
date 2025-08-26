@@ -4,7 +4,7 @@ import os, json, base64, logging, sys
 from cgi import parse_header
 
 from openai import OpenAI
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEYx"))
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
 log = logging.getLogger("improve_image")
