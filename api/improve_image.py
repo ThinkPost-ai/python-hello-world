@@ -98,54 +98,65 @@ class handler(BaseHTTPRequestHandler):
 
         # 1) Ask the Responses API to run the image_generation tool (force PNG)
         image_b64 = None
+## SECION
         try:
+            # Build multimodal input (text + image URL)
+            content = [{"type": "input_text", "text": prompt}]
+            # Accept a single string or a list (if client ever sends an array)
+            urls = [u for u in ([image_url] if isinstance(image_url, str) else image_url) if u]
+            for u in urls:
+                content.append({"type": "input_image", "image_url": u})
+
+            # Nudge the model to actually call the tool and produce a single PNG of the requested size
             resp = client.responses.create(
                 model="gpt-4.1",
-                input=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": image_url},
-                    ],
-                }],
-                tools=[{
-                    "type": "image_generation",
-                    "output_format": "png",
-                    "size": size,
-                    "n": 1
-                }],
-                tool_choice={"type": "tool", "name": "image_generation"},
+                input=[
+                    {
+                        "role": "system",
+                        "content": [{"type": "text",
+                                     "text": f"Use the image_generation tool to output exactly one {size} PNG. "
+                                             f'Return only the image as base64 (no text).'}]
+                    },
+                    {"role": "user", "content": content},
+                ],
+                tools=[{"type": "image_generation"}],
             )
 
-            # extract base64 from the tool output
-            for item in getattr(resp, "output", []) or []:
+            # Extract base64 image from tool output (robust to SDK variations)
+            out_b64 = None
+            items = getattr(resp, "output", []) or []
+            for item in items:
                 t = getattr(item, "type", None)
-                if t == "image_generation_call" and hasattr(item, "result"):
-                    image_b64 = item.result
+                if t == "image_generation_call" and hasattr(item, "result") and item.result:
+                    out_b64 = item.result
                     break
-                if t == "image" and hasattr(item, "image_base64"):
-                    image_b64 = item.image_base64
+                if t == "image" and hasattr(item, "image_base64") and item.image_base64:
+                    out_b64 = item.image_base64
                     break
+                if hasattr(item, "content"):  # nested content fallback
+                    for sub in (item.content or []):
+                        if getattr(sub, "type", None) == "image" and hasattr(sub, "image_base64"):
+                            out_b64 = sub.image_base64
+                            break
+                    if out_b64:
+                        break
 
-            if not image_b64:
-                log.warning("No image in response; will fallback. Resp: %s", resp)
-                raise RuntimeError("tool produced no image")
+            # Last-ditch: sometimes output_text may contain a data URL
+            if not out_b64:
+                possible = (getattr(resp, "output_text", "") or "").strip()
+                m = DATA_URL_RE.match(possible)
+                if m:
+                    out_b64 = m.group(2)
+
+            if not out_b64:
+                log.error("No image found in response. Raw: %r", resp)
+                return send_json(self, 502, {"error": "no image in response"})
+
+            image_b64 = out_b64
 
         except Exception as e:
-            # 2) Fallback to Images API: generate-from-text using refs in prompt
-            log.info("Falling back to Images API due to: %s", e)
-            try:
-                ref_text = f" Use this reference image: {image_url}"
-                gen = client.images.generate(
-                    model="gpt-image-1",
-                    prompt=prompt + ref_text,
-                    size=size,
-                )
-                image_b64 = gen.data[0].b64_json
-            except Exception as e2:
-                log.exception("Images API fallback failed")
-                return send_json(self, 500, {"error": f"OpenAI error: {str(e2)}"})
-
+            log.exception("OpenAI image generation failed")
+            return send_json(self, 500, {"error": f"OpenAI call failed: {e}"})
         # 3) Clean + decode the base64 (strip data URL if present)
         mime_hint, payload_b64 = _strip_data_url(image_b64)
         try:
