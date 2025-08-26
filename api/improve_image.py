@@ -122,62 +122,39 @@ class handler(BaseHTTPRequestHandler):
 ## SECION
 ## SECION
         try:
-            # Build multimodal input (text + image URL[s])
+            # Build multimodal input (text + image URL[s]) exactly like Colab
             content = [{"type": "input_text", "text": prompt}]
             urls = [image_url] if isinstance(image_url, str) else (image_url or [])
             for u in urls:
                 if u:
                     content.append({"type": "input_image", "image_url": u})
 
-            # Responses API with the built-in image_generation tool
-            # Force the tool to run and pass size via tool_config.
-            # --- Try with explicit tool_choice + size via extra_body (works on most 1.x SDKs)
-            try:
-                resp = client.responses.create(
-                    model="gpt-4.1",
-                    input=[{"role": "user", "content": content}],
-                    tools=[{"type": "image_generation"}],
-                    tool_choice={"type": "image_generation"},
-                    extra_body={  # older SDKs ignore unknown fields here
-                        "tool_config": {"image_generation": {"size": size}}
-                    },
-                )
-            except TypeError:
-                # Very old SDK: no extra_body/tool_choice support — push size via system message
-                resp = client.responses.create(
-                    model="gpt-4.1",
-                    input=[
-                        {"role": "system", "content": [
-                            {"type": "text",
-                             "text": f"When you call the image_generation tool, output exactly one {size} PNG and nothing else."}
-                        ]},
-                        {"role": "user", "content": content},
-                    ],
-                    tools=[{"type": "image_generation"}],
-                )
+            # Call Responses API with the image_generation tool (no tool_config)
+            resp = client.responses.create(
+                model="gpt-4.1",
+                input=[{"role": "user", "content": content}],
+                tools=[{"type": "image_generation"}],
+            )
 
-            # Extract base64 image from the tool result (handle SDK variants)
+            # Extract base64 image(s) from the tool output
             out_b64 = None
-
-            # v1 SDK typically returns items in resp.output
             for item in (getattr(resp, "output", []) or []):
                 t = getattr(item, "type", None)
-                if t == "image_generation_call" and hasattr(item, "result") and item.result:
+                if t == "image_generation_call" and getattr(item, "result", None):
                     out_b64 = item.result
                     break
-                if t == "image" and hasattr(item, "image_base64") and item.image_base64:
+                if t == "image" and getattr(item, "image_base64", None):
                     out_b64 = item.image_base64
                     break
-                # nested content fallback
                 if hasattr(item, "content"):
                     for sub in (item.content or []):
-                        if getattr(sub, "type", None) == "image" and hasattr(sub, "image_base64"):
+                        if getattr(sub, "type", None) == "image" and getattr(sub, "image_base64", None):
                             out_b64 = sub.image_base64
                             break
                     if out_b64:
                         break
 
-            # Last chance: sometimes output_text can contain a data URL
+            # Last chance: data URL in output_text
             if not out_b64:
                 possible = (getattr(resp, "output_text", "") or "").strip()
                 m = DATA_URL_RE.match(possible)
@@ -190,25 +167,13 @@ class handler(BaseHTTPRequestHandler):
             image_b64 = out_b64
 
         except Exception as e:
-            # Bubble up useful details so you can see the real cause in the response
             import traceback
-            err_msg = str(e)
-            tb = traceback.format_exc()
-            detail = {"error": "OpenAI call failed", "message": err_msg, "trace": tb}
-
-            # Try to extract structured fields the new SDK exposes on HTTP errors
-            try:
-                status = getattr(e, "status_code", None)
-                err_obj = getattr(e, "response", None)
-                if status is not None:
-                    detail["status_code"] = status
-                if err_obj is not None:
-                    detail["api_response"] = getattr(err_obj, "json", lambda: None)()
-            except Exception:
-                pass
-
             log.exception("OpenAI image generation failed")
-            return send_json(self, 500, detail)
+            return send_json(self, 500, {
+                "error": "OpenAI call failed",
+                "message": str(e),
+                "trace": traceback.format_exc(),
+            })
         # 3) Clean + decode the base64 (strip data URL if present)
         mime_hint, payload_b64 = _strip_data_url(image_b64)
         try:
