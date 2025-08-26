@@ -73,26 +73,48 @@ class handler(BaseHTTPRequestHandler):
         if err:
             return send_json(self, 500, {"error": err})
 
-        ctype_raw = self.headers.get("content-type", "")
-        clen = int(self.headers.get("content-length", "0") or 0)
-        main_type, _ = parse_header(ctype_raw)
-        log.info("POST content-type=%r main=%r len=%d", ctype_raw, main_type, clen)
+        # --- tolerant body read + parsing -----------------------------------
+        ctype_raw = self.headers.get("content-type", "") or ""
+        clen_raw  = self.headers.get("content-length", "") or ""
+        try:
+            clen = int(clen_raw) if clen_raw else 0
+        except Exception:
+            clen = 0
 
-        body = self.rfile.read(clen) if clen else b"{}"
-        if main_type != "application/json" and not body.strip().startswith(b"{"):
-            return send_json(self, 415, {
-                "error": "Use application/json with {prompt, image_url}",
-                "got_content_type": ctype_raw
-            })
+        main_type, _ = parse_header(ctype_raw)
+        main_type = (main_type or "").lower()
+
+        body = self.rfile.read(clen) if clen else b""
+        raw = (body or b"").strip()
+
+        # Accept JSON (with/without charset), or anything that starts with "{"
+        is_jsonish = main_type.startswith("application/json") or raw.startswith(b"{")
+        # Accept classic curl form posts too
+        is_form    = main_type == "application/x-www-form-urlencoded"
+
+        log.info("POST content-type=%r main=%r len=%d jsonish=%s form=%s",
+                 ctype_raw, main_type, len(raw), is_jsonish, is_form)
 
         try:
-            data = json.loads(body.decode("utf-8", "ignore") or "{}")
-        except json.JSONDecodeError:
-            return send_json(self, 400, {"error": "Invalid JSON payload"})
+            if is_form:
+                from urllib.parse import parse_qs
+                qs = parse_qs(raw.decode("utf-8", "ignore"))
+                data = {k: v[0] for k, v in qs.items()}
+            else:
+                # Try JSON regardless of charset or exact header
+                data = json.loads(raw.decode("utf-8", "ignore") or "{}")
+        except Exception:
+            return send_json(self, 400, {
+                "error": "Invalid request body. Send JSON or x-www-form-urlencoded.",
+                "got_content_type": ctype_raw,
+                "body_preview": raw[:100].decode("utf-8", "ignore")
+            })
 
-        prompt = (data.get("prompt") or "").strip()
+        prompt    = (data.get("prompt") or "").strip()
         image_url = (data.get("image_url") or "").strip()
-        size = (data.get("size") or "1024x1024").strip()
+        size      = (data.get("size") or "1024x1024").strip()
+        if not prompt:     return send_json(self, 400, {"error": "Missing 'prompt'"})
+        if not image_url:  return send_json(self, 400, {"error": "Missing 'image_url'"})
         if not prompt:     return send_json(self, 400, {"error": "Missing 'prompt'"})
         if not image_url:  return send_json(self, 400, {"error": "Missing 'image_url'"})
 
