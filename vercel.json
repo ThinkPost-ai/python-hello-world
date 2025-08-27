@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/improve_image.py": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   },
   "redirects": [{ "source": "/", "destination": "/api" }]
