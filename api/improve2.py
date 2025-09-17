@@ -293,13 +293,14 @@
 #                 "message": str(e),
 #                 "trace": traceback.format_exc(),
 #             })
+
+
 # route: /api/image_generator
 from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, re
 from cgi import parse_header
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
-import urllib.request  # for callback POSTs
 from openai import OpenAI
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
@@ -331,7 +332,7 @@ def _decode_image_b64(b64: str) -> bytes:
 
 def _detect_mime(buf: bytes) -> str:
     if buf.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png"
-    if buf.startswith(b"\xff\xd8"): return "image/jpeg"   # lenient for JPEG
+    if buf.startswith(b"\xff\xd8"): return "image/jpeg"
     if len(buf) >= 12 and buf[0:4] == b"RIFF" and buf[8:12] == b"WEBP": return "image/webp"
     return "application/octet-stream"
 
@@ -343,10 +344,6 @@ def _check_key():
     return ""
 
 def _fetch_url_to_base64(url: str, timeout: int = 20):
-    """
-    Downloads an image URL and returns (mime, base64_string).
-    Caps at 6MB to avoid huge memory/latency.
-    """
     req = Request(url, headers={"User-Agent": "image-generator/1.0"})
     with urlopen(req, timeout=timeout) as resp:
         mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].lower()
@@ -438,17 +435,7 @@ STRICT INSTRUCTIONS:
 - DO NOT change the product itself, its colors, shape, size, or branding
 - Only enhance: lighting, background, composition, props, angle of view, or presentation style
 - The product should remain clearly recognizable as the same item from the original image
-
-CRITICAL TEXT HANDLING INSTRUCTIONS:
-- Maintain all text, logos, and brand elements exactly as they appear in the original
-- For Arabic text specifically:
-  * Arabic text MUST be written RIGHT-TO-LEFT (RTL direction)
-  * Arabic letters MUST connect properly and maintain correct letterforms
-  * Preserve Arabic script integrity with proper letter shapes (initial, medial, final, isolated forms)
-  * Keep Arabic text spacing and alignment consistent with original
-  * Do NOT mirror or flip Arabic text - maintain proper RTL reading direction
 """
-
             response = client.responses.create(
                 model="gpt-4.1",
                 input=[{
@@ -460,16 +447,13 @@ CRITICAL TEXT HANDLING INSTRUCTIONS:
                 }],
                 tools=[{"type": "image_generation"}],
             )
-
             image_generation_calls = [o for o in response.output if getattr(o, "type", "") == "image_generation_call"]
             if image_generation_calls:
-                image_data = image_generation_calls[0].result  # base64 (no data URL)
-                log.info(f"Generated image for {key}, base64 length: {len(image_data)}")
+                image_data = image_generation_calls[0].result
                 images[key] = image_data
             else:
                 log.warning("No image generated for %s", key)
                 images[key] = None
-
         except Exception as e:
             log.exception(f"Error generating image for {key}: {e}")
             images[key] = None
@@ -488,26 +472,20 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         send_json(self, 200, {
             "ok": True,
-            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number, callback_url?: string, product_id?: string }",
-            "description": "Pass image_url (recommended) or base64. Optionally include callback_url and product_id to receive results server-to-server."
+            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number }",
+            "description": "Pass image_url (recommended) or base64. The server will convert to base64 and call OpenAI."
         })
 
     def do_POST(self):
-        # fail fast on key issues
         err = _check_key()
         if err:
             return send_json(self, 500, {"error": err})
 
-        # parse body
-        ctype_raw = self.headers.get("content-type", "") or ""
-        clen_raw  = self.headers.get("content-length", "") or ""
+        clen_raw = self.headers.get("content-length", "") or ""
         try:
             clen = int(clen_raw) if clen_raw else 0
         except Exception:
             clen = 0
-
-        main_type, _ = parse_header(ctype_raw)
-        main_type = (main_type or "").lower()
         body = self.rfile.read(clen) if clen else b""
         raw = (body or b"").strip()
 
@@ -519,10 +497,7 @@ class handler(BaseHTTPRequestHandler):
         image_url       = (data.get("image_url") or "").strip()
         image_base64_in = (data.get("image_base64") or "").strip()
         number_of_images = data.get("number_of_images", 2)
-        callback_url    = (data.get("callback_url") or "").strip()  # NEW
-        product_id      = (data.get("product_id") or "").strip()    # NEW
 
-        # validate number_of_images
         try:
             number_of_images = int(number_of_images)
             if number_of_images < 1 or number_of_images > 10:
@@ -530,16 +505,12 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return send_json(self, 400, {"error": "number_of_images must be a valid integer"})
 
-        # normalize to (mime, base64_image)
         mime, base64_image = None, None
-
         if image_url and not image_base64_in:
             try:
                 mime, base64_image = _fetch_url_to_base64(image_url)
-                log.info("Fetched image_url -> mime=%s, b64_len=%d", mime, len(base64_image))
             except (HTTPError, URLError, ValueError) as e:
                 return send_json(self, 400, {"error": f"Failed to fetch image_url: {str(e)}"})
-
         elif image_base64_in:
             mime, base64_image = _strip_data_url(image_base64_in)
             if not base64_image:
@@ -555,22 +526,12 @@ class handler(BaseHTTPRequestHandler):
         else:
             return send_json(self, 400, {"error": "Provide image_url or image_base64"})
 
-        # main flow + callback wrapping
         try:
-            # Step 1
-            log.info("Step 1: Describing image…")
             description = describe_image(base64_image, mime or "image/jpeg")
-
-            # Step 2
-            log.info("Step 2: Generating creative prompts…")
             prompts_json = generate_creative_prompts(description, base64_image, mime or "image/jpeg", number_of_images)
-
-            # Step 3
-            log.info("Step 3: Generating images…")
             generated_images = generate_images_from_prompts(
                 prompts_json, base64_image, mime or "image/jpeg", description, number_of_images
             )
-
             result = {"success": True, "generated_images": []}
             for key, image_b64 in generated_images.items():
                 if image_b64:
@@ -578,52 +539,9 @@ class handler(BaseHTTPRequestHandler):
                         "prompt": prompts_json.get(key, ""),
                         "image": f"data:image/png;base64,{image_b64}"
                     })
-
-            # --- NEW: Server-to-server callback on success ---
-            if callback_url and result["generated_images"]:
-                callback_data = {
-                    "product_id": product_id,
-                    "success": True,
-                    "generated_images": result["generated_images"]
-                }
-                try:
-                    callback_req = urllib.request.Request(
-                        callback_url,
-                        data=json.dumps(callback_data).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(callback_req, timeout=30) as callback_resp:
-                        log.info(f"Callback successful: HTTP {callback_resp.status}")
-                except Exception as cb_err:
-                    log.error(f"Callback failed: {cb_err}")
-
-            log.info("Successfully generated %d images", len(result["generated_images"]))
             return send_json(self, 200, result)
-
         except Exception as e:
             import traceback
-            log.exception("Image generation pipeline failed")
-
-            # --- NEW: callback with error ---
-            if callback_url:
-                error_data = {
-                    "product_id": product_id,
-                    "success": False,
-                    "error": str(e),
-                }
-                try:
-                    callback_req = urllib.request.Request(
-                        callback_url,
-                        data=json.dumps(error_data).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(callback_req, timeout=30) as callback_resp:
-                        log.info(f"Error callback successful: HTTP {callback_resp.status}")
-                except Exception as cb_err:
-                    log.error(f"Error callback failed: {cb_err}")
-
             return send_json(self, 500, {
                 "error": "Image generation pipeline failed",
                 "message": str(e),
