@@ -559,10 +559,15 @@ class handler(BaseHTTPRequestHandler):
                 }
                 
                 try:
+                    # when building the callback request
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {os.environ['SUPABASE_ANON_KEY']}",  # <- add this env in Vercel
+                    }
                     callback_req = urllib.request.Request(
                         callback_url,
                         data=json.dumps(callback_data).encode("utf-8"),
-                        headers={"Content-Type": "application/json"}
+                        headers=headers
                     )
                     with urllib.request.urlopen(callback_req, timeout=30) as callback_resp:
                         log.info(f"Callback successful: HTTP {callback_resp.status}")
