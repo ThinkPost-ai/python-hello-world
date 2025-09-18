@@ -313,6 +313,7 @@
 
 ##########################################################################
 # route: /api/improve2
+# route: /api/improve2
 from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, re
 from cgi import parse_header
@@ -334,6 +335,10 @@ def send_json(self, code, obj):
     self.send_header("Access-Control-Allow-Origin", "*")
     self.end_headers()
     self.wfile.write(data)
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 
 DATA_URL_RE = re.compile(r"^data:(image/[^;]+);base64,(.+)$", re.IGNORECASE)
 
@@ -370,12 +375,29 @@ def _fetch_url_to_base64(url: str, timeout: int = 20):
         return mime, b64
 
 def parse_json_safe(text: str) -> dict:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
+    """
+    Extract a JSON object from a possibly chatty response.
+    Tries code blocks first, then a broad {...} match.
+    """
+    if not text:
+        raise ValueError("Empty model output")
+    # Try ```json ... ```
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return json.loads(m.group(1))
+    # Try plain code fence ```
+    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    # Fallback: first {...}
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        return json.loads(m.group())
     raise ValueError("No JSON found in AI output")
 
-# ---------- FAST PATH: one planner call + parallel image gens ----------
+# --------------------------------------------------------------------------
+# Planner (Chat Completions) + Generator (Responses API)
+# --------------------------------------------------------------------------
 
 PLANNER_PROMPT = """
 You are a creative ad art director.
@@ -388,30 +410,46 @@ Given the reference product image (see attached), produce EXACTLY {k} diverse, h
 Rules:
 - Keep the same product identity/packaging; change only scene/lighting/props/composition/angle.
 - Prefer short, concrete directions (background, lighting, props, vibe).
-- 9:16 composition guidance if relevant.
+- Include 9:16 composition guidance if relevant.
+- Return ONLY valid JSON. No commentary.
 """
 
-def plan_prompts(image_ref: dict, k: int) -> dict:
+def to_chat_image_content(url_or_data_url: str) -> dict:
     """
-    image_ref = {"type":"input_image","image_url": "<public url>"} OR {"type":"input_image","image_url":"data:<mime>;base64,..." }
+    For chat.completions: must be {"type":"image_url","image_url":{"url": "<...>"}}
+    """
+    return {"type": "image_url", "image_url": {"url": url_or_data_url}}
+
+def to_responses_image_content(url_or_data_url: str) -> dict:
+    """
+    For responses API: must be {"type":"input_image","image_url":"<...>"}
+    """
+    return {"type": "input_image", "image_url": url_or_data_url}
+
+def plan_prompts(image_url_or_dataurl: str, k: int) -> dict:
+    """
+    Use Chat Completions with the correct content schema (text + image_url).
     """
     log.info("Planner: generating %d prompts with gpt-4o-mini", k)
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Return only valid JSON. No commentary."},
-            {"role": "user", "content": [
-                {"type": "text", "text": PLANNER_PROMPT.format(k=k)},
-                image_ref
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PLANNER_PROMPT.format(k=k)},
+                    to_chat_image_content(image_url_or_dataurl)
+                ],
+            },
         ],
-        temperature=0.7
+        temperature=0.7,
     )
     return parse_json_safe(resp.choices[0].message.content)
 
-def gen_one_image(prompt: str, image_ref: dict) -> str:
+def gen_one_image(prompt: str, image_url_or_dataurl: str) -> str:
     """
-    Calls image tool once and returns base64 (PNG) or raises.
+    Calls the Responses API tool once and returns base64 (PNG); raises on failure.
     """
     enhanced_text_prompt = f"""ENHANCEMENT IDEA: {prompt}
 
@@ -425,7 +463,7 @@ STRICT:
             "role": "user",
             "content": [
                 {"type": "input_text", "text": enhanced_text_prompt},
-                image_ref
+                to_responses_image_content(image_url_or_dataurl),
             ],
         }],
         tools=[{"type": "image_generation"}],
@@ -435,7 +473,9 @@ STRICT:
         raise RuntimeError("image_generation_call missing")
     return calls[0].result  # base64 PNG
 
-# --- handler ---------------------------------------------------------------
+# --------------------------------------------------------------------------
+# HTTP handler
+# --------------------------------------------------------------------------
 
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -453,11 +493,12 @@ class handler(BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
+        # API key check
         err = _check_key()
         if err:
             return send_json(self, 500, {"error": err})
 
-        # ---- parse body
+        # Parse body
         clen_raw = self.headers.get("content-length", "") or ""
         try:
             clen = int(clen_raw) if clen_raw else 0
@@ -469,17 +510,23 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return send_json(self, 400, {"error": "Invalid JSON body"})
 
-        image_url       = (data.get("image_url") or "").strip()
-        image_base64_in = (data.get("image_base64") or "").strip()
-        number_of_images = int(data.get("number_of_images", 3))
+        image_url        = (data.get("image_url") or "").strip()
+        image_base64_in  = (data.get("image_base64") or "").strip()
+        try:
+            number_of_images = int(data.get("number_of_images", 3))
+        except Exception:
+            return send_json(self, 400, {"error": "number_of_images must be an integer"})
+
         if number_of_images < 1 or number_of_images > 6:
             return send_json(self, 400, {"error": "number_of_images must be 1..6"})
 
-        # ---- Build the image reference to avoid big base64 if possible
-        image_ref = None
+        # Build a single canonical URL/DataURL string to feed both APIs
+        url_or_dataurl = None
+
         if image_url:
-            # fastest path: let OpenAI fetch the URL
-            image_ref = {"type": "input_image", "image_url": image_url}
+            # Fast path: pass the public URL as-is
+            url_or_dataurl = image_url
+
         elif image_base64_in:
             mime, base64_image = _strip_data_url(image_base64_in)
             if not base64_image:
@@ -492,20 +539,25 @@ class handler(BaseHTTPRequestHandler):
                 return send_json(self, 400, {"error": "Image too large (limit 6MB)"})
             if not mime or mime == "application/octet-stream":
                 mime = _detect_mime(buf) or "image/jpeg"
-            image_ref = {"type": "input_image", "image_url": f"data:{mime};base64,{base64_image}"}
+            url_or_dataurl = f"data:{mime};base64,{base64_image}"
+
         else:
             return send_json(self, 400, {"error": "Provide image_url or image_base64"})
 
         try:
-            # ---- One small planning call
-            prompts_json = plan_prompts(image_ref, number_of_images)
-            prompts = [prompts_json[k] for k in sorted(prompts_json.keys())][:number_of_images]
+            # 1) Plan once with Chat Completions (text + image_url)
+            prompts_json = plan_prompts(url_or_dataurl, number_of_images)
+            # preserve order prompt1..promptK if present
+            keys = sorted([k for k in prompts_json.keys() if k.lower().startswith("prompt")],
+                          key=lambda x: int(re.sub(r"[^\d]", "", x) or "9999"))
+            prompts = [prompts_json[k] for k in keys][:number_of_images]
             log.info("Planner returned %d prompts", len(prompts))
 
-            # ---- Parallel image generations
+            # 2) Generate images in parallel via Responses API
             results = []
-            with ThreadPoolExecutor(max_workers=min(4, number_of_images)) as ex:
-                futures = {ex.submit(gen_one_image, p, image_ref): p for p in prompts}
+            max_workers = min(4, max(1, number_of_images))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(gen_one_image, p, url_or_dataurl): p for p in prompts}
                 for fut in as_completed(futures):
                     p = futures[fut]
                     try:
