@@ -294,13 +294,13 @@
 #                 "trace": traceback.format_exc(),
 #             })
 
-
-# route: /api/image_generator
+# route: /api/improve2
 from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, re
 from cgi import parse_header
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+import urllib.request  # for callback POSTs
 from openai import OpenAI
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
@@ -472,8 +472,8 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         send_json(self, 200, {
             "ok": True,
-            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number }",
-            "description": "Pass image_url (recommended) or base64. The server will convert to base64 and call OpenAI."
+            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number, callback_url?: string, product_id?: string }",
+            "description": "Pass image_url (recommended) or base64. Optionally include callback_url and product_id for async processing."
         })
 
     def do_POST(self):
@@ -497,6 +497,8 @@ class handler(BaseHTTPRequestHandler):
         image_url       = (data.get("image_url") or "").strip()
         image_base64_in = (data.get("image_base64") or "").strip()
         number_of_images = data.get("number_of_images", 2)
+        callback_url    = (data.get("callback_url") or "").strip()  # NEW
+        product_id      = (data.get("product_id") or "").strip()    # NEW
 
         try:
             number_of_images = int(number_of_images)
@@ -509,6 +511,7 @@ class handler(BaseHTTPRequestHandler):
         if image_url and not image_base64_in:
             try:
                 mime, base64_image = _fetch_url_to_base64(image_url)
+                log.info("Fetched image_url -> mime=%s, b64_len=%d", mime, len(base64_image))
             except (HTTPError, URLError, ValueError) as e:
                 return send_json(self, 400, {"error": f"Failed to fetch image_url: {str(e)}"})
         elif image_base64_in:
@@ -527,11 +530,17 @@ class handler(BaseHTTPRequestHandler):
             return send_json(self, 400, {"error": "Provide image_url or image_base64"})
 
         try:
+            log.info("Step 1: Describing image...")
             description = describe_image(base64_image, mime or "image/jpeg")
+            
+            log.info("Step 2: Generating creative prompts...")
             prompts_json = generate_creative_prompts(description, base64_image, mime or "image/jpeg", number_of_images)
+            
+            log.info("Step 3: Generating images...")
             generated_images = generate_images_from_prompts(
                 prompts_json, base64_image, mime or "image/jpeg", description, number_of_images
             )
+            
             result = {"success": True, "generated_images": []}
             for key, image_b64 in generated_images.items():
                 if image_b64:
@@ -539,9 +548,53 @@ class handler(BaseHTTPRequestHandler):
                         "prompt": prompts_json.get(key, ""),
                         "image": f"data:image/png;base64,{image_b64}"
                     })
+
+            # NEW: Callback handling
+            if callback_url and result["generated_images"]:
+                log.info(f"Making callback to: {callback_url}")
+                callback_data = {
+                    "product_id": product_id,
+                    "success": True,
+                    "generated_images": result["generated_images"]
+                }
+                
+                try:
+                    callback_req = urllib.request.Request(
+                        callback_url,
+                        data=json.dumps(callback_data).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(callback_req, timeout=30) as callback_resp:
+                        log.info(f"Callback successful: HTTP {callback_resp.status}")
+                except Exception as cb_err:
+                    log.error(f"Callback failed: {cb_err}")
+                    # Don't fail the main request if callback fails
+            
+            log.info("Successfully generated %d images", len(result["generated_images"]))
             return send_json(self, 200, result)
+            
         except Exception as e:
             import traceback
+            log.exception("Image generation pipeline failed")
+            
+            # NEW: Error callback
+            if callback_url:
+                error_data = {
+                    "product_id": product_id,
+                    "success": False,
+                    "error": str(e)
+                }
+                try:
+                    callback_req = urllib.request.Request(
+                        callback_url,
+                        data=json.dumps(error_data).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(callback_req, timeout=30) as callback_resp:
+                        log.info(f"Error callback successful: HTTP {callback_resp.status}")
+                except Exception as cb_err:
+                    log.error(f"Error callback failed: {cb_err}")
+            
             return send_json(self, 500, {
                 "error": "Image generation pipeline failed",
                 "message": str(e),
