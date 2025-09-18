@@ -5,7 +5,7 @@
 # from urllib.request import urlopen, Request
 # from urllib.error import URLError, HTTPError
 # from openai import OpenAI
-#
+
 # logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
 # log = logging.getLogger("image_generator")
 
