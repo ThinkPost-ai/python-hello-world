@@ -315,8 +315,7 @@
 # route: /api/improve2
 # route: /api/improve2
 from http.server import BaseHTTPRequestHandler
-import os, json, base64, logging, sys, re
-from cgi import parse_header
+import os, json, base64, logging, sys, re, urllib.request
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -364,35 +363,15 @@ def _check_key():
         return "OPENAI_API_KEY format looks wrong"
     return ""
 
-def _fetch_url_to_base64(url: str, timeout: int = 20):
-    req = Request(url, headers={"User-Agent": "image-generator/1.0"})
-    with urlopen(req, timeout=timeout) as resp:
-        mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].lower()
-        data = resp.read()
-        if len(data) > 6 * 1024 * 1024:
-            raise ValueError("Image too large (limit 6MB)")
-        b64 = base64.b64encode(data).decode("ascii")
-        return mime, b64
-
 def parse_json_safe(text: str) -> dict:
-    """
-    Extract a JSON object from a possibly chatty response.
-    Tries code blocks first, then a broad {...} match.
-    """
     if not text:
         raise ValueError("Empty model output")
-    # Try ```json ... ```
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
-    if m:
-        return json.loads(m.group(1))
-    # Try plain code fence ```
+    if m: return json.loads(m.group(1))
     m = re.search(r"```\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    # Fallback: first {...}
+    if m: return json.loads(m.group(1))
     m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        return json.loads(m.group())
+    if m: return json.loads(m.group())
     raise ValueError("No JSON found in AI output")
 
 # --------------------------------------------------------------------------
@@ -402,11 +381,11 @@ def parse_json_safe(text: str) -> dict:
 PLANNER_PROMPT = """
 You are a creative ad art director.
 Given the reference product image (see attached), produce EXACTLY {k} diverse, high-impact enhancement ideas as JSON:
-{{
+{
   "prompt1": "...",
   "prompt2": "...",
   ...
-}}
+}
 Rules:
 - Keep the same product identity/packaging; change only scene/lighting/props/composition/angle.
 - Prefer short, concrete directions (background, lighting, props, vibe).
@@ -415,21 +394,12 @@ Rules:
 """
 
 def to_chat_image_content(url_or_data_url: str) -> dict:
-    """
-    For chat.completions: must be {"type":"image_url","image_url":{"url": "<...>"}}
-    """
     return {"type": "image_url", "image_url": {"url": url_or_data_url}}
 
 def to_responses_image_content(url_or_data_url: str) -> dict:
-    """
-    For responses API: must be {"type":"input_image","image_url":"<...>"}
-    """
     return {"type": "input_image", "image_url": url_or_data_url}
 
 def plan_prompts(image_url_or_dataurl: str, k: int) -> dict:
-    """
-    Use Chat Completions with the correct content schema (text + image_url).
-    """
     log.info("Planner: generating %d prompts with gpt-4o-mini", k)
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -448,9 +418,6 @@ def plan_prompts(image_url_or_dataurl: str, k: int) -> dict:
     return parse_json_safe(resp.choices[0].message.content)
 
 def gen_one_image(prompt: str, image_url_or_dataurl: str) -> str:
-    """
-    Calls the Responses API tool once and returns base64 (PNG); raises on failure.
-    """
     enhanced_text_prompt = f"""ENHANCEMENT IDEA: {prompt}
 
 STRICT:
@@ -488,7 +455,7 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         send_json(self, 200, {
             "ok": True,
-            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number }",
+            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number, callback_url?: string, product_id?: string }",
             "hint": "Use image_url (public) for fastest performance."
         })
 
@@ -512,6 +479,8 @@ class handler(BaseHTTPRequestHandler):
 
         image_url        = (data.get("image_url") or "").strip()
         image_base64_in  = (data.get("image_base64") or "").strip()
+        callback_url     = (data.get("callback_url") or "").strip()    # <--- support callback
+        product_id       = (data.get("product_id") or "").strip()      # <--- pass-through id
         try:
             number_of_images = int(data.get("number_of_images", 3))
         except Exception:
@@ -524,9 +493,7 @@ class handler(BaseHTTPRequestHandler):
         url_or_dataurl = None
 
         if image_url:
-            # Fast path: pass the public URL as-is
             url_or_dataurl = image_url
-
         elif image_base64_in:
             mime, base64_image = _strip_data_url(image_base64_in)
             if not base64_image:
@@ -540,20 +507,18 @@ class handler(BaseHTTPRequestHandler):
             if not mime or mime == "application/octet-stream":
                 mime = _detect_mime(buf) or "image/jpeg"
             url_or_dataurl = f"data:{mime};base64,{base64_image}"
-
         else:
             return send_json(self, 400, {"error": "Provide image_url or image_base64"})
 
         try:
-            # 1) Plan once with Chat Completions (text + image_url)
+            # 1) Plan once with Chat Completions
             prompts_json = plan_prompts(url_or_dataurl, number_of_images)
-            # preserve order prompt1..promptK if present
             keys = sorted([k for k in prompts_json.keys() if k.lower().startswith("prompt")],
                           key=lambda x: int(re.sub(r"[^\d]", "", x) or "9999"))
             prompts = [prompts_json[k] for k in keys][:number_of_images]
             log.info("Planner returned %d prompts", len(prompts))
 
-            # 2) Generate images in parallel via Responses API
+            # 2) Generate images in parallel
             results = []
             max_workers = min(4, max(1, number_of_images))
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -566,14 +531,55 @@ class handler(BaseHTTPRequestHandler):
                     except Exception as e:
                         log.error("Image gen failed for a prompt: %s", e)
 
-            return send_json(self, 200, {
-                "success": True,
-                "generated_images": results
-            })
+            # 3) Optional: callback to Supabase with auth (so your EF is authorized)
+            if callback_url and results:
+                try:
+                    headers = {
+                        "Content-Type": "application/json",
+                        # put this ENV in Vercel Project Settings
+                        "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY','')}",
+                        "apikey": os.environ.get('SUPABASE_ANON_KEY',''),
+                    }
+                    payload = {
+                        "product_id": product_id,
+                        "success": True,
+                        "generated_images": results,
+                    }
+                    req = urllib.request.Request(
+                        callback_url,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers=headers
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        log.info(f"Callback -> {callback_url} status={resp.status}")
+                except Exception as cb_err:
+                    log.error(f"Callback failed: {cb_err}")
+
+            return send_json(self, 200, {"success": True, "generated_images": results})
 
         except Exception as e:
             import traceback
             log.exception("Fast pipeline failed")
+
+            # If callback was provided, also send a failure notification
+            if callback_url:
+                try:
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY','')}",
+                        "apikey": os.environ.get('SUPABASE_ANON_KEY',''),
+                    }
+                    payload = {"product_id": product_id, "success": False, "error": str(e)}
+                    req = urllib.request.Request(
+                        callback_url,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers=headers
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        log.info(f"Error callback -> {callback_url} status={resp.status}")
+                except Exception as cb_err:
+                    log.error(f"Error callback failed: {cb_err}")
+
             return send_json(self, 500, {
                 "error": "pipeline_failed",
                 "message": str(e),
