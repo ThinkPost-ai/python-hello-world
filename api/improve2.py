@@ -313,7 +313,6 @@
 
 ##########################################################################
 # route: /api/improve2
-
 # route: /api/improve2
 from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, re
@@ -382,18 +381,14 @@ def _read_body(self) -> bytes:
             try:
                 size = int(size_line, 16)
             except Exception:
-                # not a valid chunk size -> stop
                 break
             if size == 0:
-                # consume trailing CRLF
-                self.rfile.readline()
+                self.rfile.readline()  # trailing CRLF
                 break
             chunk = self.rfile.read(size)
             buf += chunk
-            # consume CRLF after each chunk
-            self.rfile.read(2)
+            self.rfile.read(2)  # CRLF
         return buf
-    # Fallback to content-length
     try:
         clen = int(self.headers.get("content-length", "0") or "0")
     except Exception:
@@ -401,9 +396,6 @@ def _read_body(self) -> bytes:
     return self.rfile.read(clen) if clen > 0 else b""
 
 def parse_json_safe(text: str) -> dict:
-    """
-    Extract a JSON object from a possibly chatty response.
-    """
     if not text:
         raise ValueError("Empty model output")
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
@@ -418,7 +410,6 @@ def parse_json_safe(text: str) -> dict:
 # Planner (Chat Completions) + Generator (Responses API)
 # --------------------------------------------------------------------------
 
-# NOTE: braces inside need to be doubled for .format() to not treat them as fields
 PLANNER_PROMPT = """
 You are a creative ad art director.
 Given the reference product image (see attached), produce EXACTLY {k} diverse, high-impact enhancement ideas as JSON:
@@ -435,11 +426,9 @@ Rules:
 """
 
 def to_chat_image_content(url_or_data_url: str) -> dict:
-    # For chat.completions
     return {"type": "image_url", "image_url": {"url": url_or_data_url}}
 
 def to_responses_image_content(url_or_data_url: str) -> dict:
-    # For responses API
     return {"type": "input_image", "image_url": url_or_data_url}
 
 def plan_prompts(image_url_or_dataurl: str, k: int) -> dict:
@@ -499,7 +488,7 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         send_json(self, 200, {
             "ok": True,
-            "usage": "POST JSON: { image_url?: string, image_base64?: string, number_of_images?: number, callback_url?: string, product_id?: string, auth_token?: string }",
+            "usage": "POST JSON: { image_url?, image_base64?, number_of_images?, callback_url?, product_id?, auth_token?, user_id?, product_name?, product_price?, product_description?, original_image_path? }",
             "hint": "Use image_url (public) for fastest performance."
         })
 
@@ -521,6 +510,13 @@ class handler(BaseHTTPRequestHandler):
         callback_url     = (data.get("callback_url") or "").strip()
         product_id       = (data.get("product_id") or "").strip()
         user_auth_token  = (data.get("auth_token") or "").strip()
+
+        # ✨ NEW: extra fields to pass through to Supabase callback
+        user_id               = (data.get("user_id") or "").strip()
+        product_name          = (data.get("product_name") or "").strip()
+        product_price         = data.get("product_price")
+        product_description   = (data.get("product_description") or "").strip()
+        original_image_path   = (data.get("original_image_path") or "").strip()
 
         try:
             number_of_images = int(data.get("number_of_images", 3))
@@ -584,7 +580,12 @@ class handler(BaseHTTPRequestHandler):
                         "product_id": product_id,
                         "success": True,
                         "generated_images": results,
-                        # optional: pass back user token if your callback uses it
+                        # pass-through fields
+                        "user_id": user_id,
+                        "product_name": product_name,
+                        "product_price": product_price,
+                        "product_description": product_description,
+                        "original_image_path": original_image_path,
                         "auth_token": user_auth_token,
                     }
                     req = urllib.request.Request(
@@ -603,7 +604,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             import traceback
             log.exception("Fast pipeline failed")
-            # Send error callback too (best-effort)
+            # Send error callback too (best-effort) with the same pass-through fields
             if callback_url:
                 try:
                     req = urllib.request.Request(
@@ -612,6 +613,11 @@ class handler(BaseHTTPRequestHandler):
                             "product_id": product_id,
                             "success": False,
                             "error": str(e),
+                            "user_id": user_id,
+                            "product_name": product_name,
+                            "product_price": product_price,
+                            "product_description": product_description,
+                            "original_image_path": original_image_path,
                             "auth_token": user_auth_token
                         }).encode("utf-8"),
                         headers={
