@@ -313,17 +313,18 @@
 
 ##########################################################################
 # route: /api/improve2
-
 # route: /api/improve2
 from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, re
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.request  # used for callback POST
 from openai import OpenAI
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
 log = logging.getLogger("image_generator")
+
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def send_json(self, code, obj):
@@ -334,6 +335,10 @@ def send_json(self, code, obj):
     self.send_header("Access-Control-Allow-Origin", "*")
     self.end_headers()
     self.wfile.write(data)
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 
 DATA_URL_RE = re.compile(r"^data:(image/[^;]+);base64,(.+)$", re.IGNORECASE)
 
@@ -359,7 +364,45 @@ def _check_key():
         return "OPENAI_API_KEY format looks wrong"
     return ""
 
+def _read_body(self) -> bytes:
+    """
+    Read request body supporting both Content-Length and
+    Transfer-Encoding: chunked (used by Deno fetch).
+    """
+    if (self.headers.get("transfer-encoding", "").lower() == "chunked"):
+        buf = b""
+        while True:
+            size_line = self.rfile.readline()
+            if not size_line:
+                break
+            size_line = size_line.strip()
+            if not size_line:
+                continue
+            try:
+                size = int(size_line, 16)
+            except Exception:
+                # not a valid chunk size -> stop
+                break
+            if size == 0:
+                # consume trailing CRLF
+                self.rfile.readline()
+                break
+            chunk = self.rfile.read(size)
+            buf += chunk
+            # consume CRLF after each chunk
+            self.rfile.read(2)
+        return buf
+    # Fallback to content-length
+    try:
+        clen = int(self.headers.get("content-length", "0") or "0")
+    except Exception:
+        clen = 0
+    return self.rfile.read(clen) if clen > 0 else b""
+
 def parse_json_safe(text: str) -> dict:
+    """
+    Extract a JSON object from a possibly chatty response.
+    """
     if not text:
         raise ValueError("Empty model output")
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
@@ -370,12 +413,18 @@ def parse_json_safe(text: str) -> dict:
     if m: return json.loads(m.group())
     raise ValueError("No JSON found in AI output")
 
+# --------------------------------------------------------------------------
+# Planner (Chat Completions) + Generator (Responses API)
+# --------------------------------------------------------------------------
+
+# NOTE: braces inside need to be doubled for .format() to not treat them as fields
 PLANNER_PROMPT = """
 You are a creative ad art director.
 Given the reference product image (see attached), produce EXACTLY {k} diverse, high-impact enhancement ideas as JSON:
 {{
   "prompt1": "...",
-  "prompt2": "..."
+  "prompt2": "...",
+  "prompt3": "..."
 }}
 Rules:
 - Keep the same product identity/packaging; change only scene/lighting/props/composition/angle.
@@ -385,13 +434,14 @@ Rules:
 """
 
 def to_chat_image_content(url_or_data_url: str) -> dict:
+    # For chat.completions
     return {"type": "image_url", "image_url": {"url": url_or_data_url}}
 
 def to_responses_image_content(url_or_data_url: str) -> dict:
+    # For responses API
     return {"type": "input_image", "image_url": url_or_data_url}
 
 def plan_prompts(image_url_or_dataurl: str, k: int) -> dict:
-    # IMPORTANT: double {{ and }} in PLANNER_PROMPT to avoid KeyError from .format()
     prompt_text = PLANNER_PROMPT.format(k=k)
     log.info("Planner: generating %d prompts with gpt-4o-mini", k)
     resp = client.chat.completions.create(
@@ -433,6 +483,10 @@ STRICT:
         raise RuntimeError("image_generation_call missing")
     return calls[0].result  # base64 PNG
 
+# --------------------------------------------------------------------------
+# HTTP handler
+# --------------------------------------------------------------------------
+
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
@@ -453,15 +507,12 @@ class handler(BaseHTTPRequestHandler):
         if err:
             return send_json(self, 500, {"error": err})
 
-        clen_raw = self.headers.get("content-length", "") or ""
-        try:
-            clen = int(clen_raw) if clen_raw else 0
-        except Exception:
-            clen = 0
-        raw = (self.rfile.read(clen) if clen else b"").strip()
+        # Read body (supports chunked)
+        raw = (_read_body(self) or b"").strip()
         try:
             data = json.loads(raw.decode("utf-8", "ignore") or "{}")
         except Exception:
+            log.error(f"Invalid JSON body; headers={dict(self.headers)}, first200={raw[:200]!r}")
             return send_json(self, 400, {"error": "Invalid JSON body"})
 
         image_url        = (data.get("image_url") or "").strip()
@@ -480,7 +531,7 @@ class handler(BaseHTTPRequestHandler):
         if not image_url and not image_base64_in:
             return send_json(self, 400, {"error": "Provide image_url or image_base64"})
 
-        # canonical URL/dataURL
+        # Build canonical url/dataURL
         if image_url:
             url_or_dataurl = image_url
         else:
@@ -498,12 +549,16 @@ class handler(BaseHTTPRequestHandler):
             url_or_dataurl = f"data:{mime};base64,{base64_image}"
 
         try:
+            # 1) get prompts
             prompts_json = plan_prompts(url_or_dataurl, number_of_images)
-            keys = sorted([k for k in prompts_json.keys() if k.lower().startswith("prompt")],
-                          key=lambda x: int(re.sub(r"[^\d]", "", x) or "9999"))
+            keys = sorted(
+                [k for k in prompts_json.keys() if k.lower().startswith("prompt")],
+                key=lambda x: int(re.sub(r"[^\d]", "", x) or "9999")
+            )
             prompts = [prompts_json[k] for k in keys][:number_of_images]
             log.info("Planner returned %d prompts", len(prompts))
 
+            # 2) generate images in parallel
             results = []
             max_workers = min(4, max(1, number_of_images))
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -516,23 +571,21 @@ class handler(BaseHTTPRequestHandler):
                     except Exception as e:
                         log.error("Image gen failed for a prompt: %s", e)
 
-            # Callback with results (threaded user token through)
-            
-            if callback_url and result["generated_images"]:
+            # 3) callback with results (if provided)
+            if callback_url and results:
                 try:
                     headers = {
                         "Content-Type": "application/json",
-                        # Required so Supabase lets the request through:
-                        "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY','')}",
-                        "apikey": os.environ.get("SUPABASE_ANON_KEY",""),
+                        "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY', '')}",
+                        "apikey": os.environ.get("SUPABASE_ANON_KEY", ""),
                     }
                     payload = {
                         "product_id": product_id,
                         "success": True,
-                        "generated_images": result["generated_images"],
+                        "generated_images": results,
+                        # optional: pass back user token if your callback uses it
+                        "auth_token": user_auth_token,
                     }
-            
-                    import urllib.request, json
                     req = urllib.request.Request(
                         callback_url,
                         data=json.dumps(payload).encode("utf-8"),
@@ -547,23 +600,27 @@ class handler(BaseHTTPRequestHandler):
             return send_json(self, 200, {"success": True, "generated_images": results})
 
         except Exception as e:
-            import traceback, urllib.request
+            import traceback
             log.exception("Fast pipeline failed")
-            # Send error callback too
-            if (data.get("callback_url") or "").strip():
+            # Send error callback too (best-effort)
+            if callback_url:
                 try:
                     req = urllib.request.Request(
-                        data["callback_url"],
+                        callback_url,
                         data=json.dumps({
                             "product_id": product_id,
                             "success": False,
                             "error": str(e),
                             "auth_token": user_auth_token
                         }).encode("utf-8"),
-                        headers={"Content-Type": "application/json"}
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY', '')}",
+                            "apikey": os.environ.get("SUPABASE_ANON_KEY", ""),
+                        }
                     )
                     with urllib.request.urlopen(req, timeout=30) as resp:
-                        log.info("Error callback -> %s status=%d", data["callback_url"], resp.status)
+                        log.info("Error callback -> %s status=%d", callback_url, resp.status)
                 except Exception as cb_err:
                     log.error("Error callback failed: %s", cb_err)
 
