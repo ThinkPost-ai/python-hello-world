@@ -381,11 +381,11 @@ def parse_json_safe(text: str) -> dict:
 PLANNER_PROMPT = """
 You are a creative ad art director.
 Given the reference product image (see attached), produce EXACTLY {k} diverse, high-impact enhancement ideas as JSON:
-{
+{{
   "prompt1": "...",
   "prompt2": "...",
   ...
-}
+}}
 Rules:
 - Keep the same product identity/packaging; change only scene/lighting/props/composition/angle.
 - Prefer short, concrete directions (background, lighting, props, vibe).
