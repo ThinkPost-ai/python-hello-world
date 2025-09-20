@@ -517,24 +517,32 @@ class handler(BaseHTTPRequestHandler):
                         log.error("Image gen failed for a prompt: %s", e)
 
             # Callback with results (threaded user token through)
-            if callback_url and results:
+            
+            if callback_url and result["generated_images"]:
                 try:
-                    import urllib.request
+                    headers = {
+                        "Content-Type": "application/json",
+                        # Required so Supabase lets the request through:
+                        "Authorization": f"Bearer {os.environ.get('SUPABASE_ANON_KEY','')}",
+                        "apikey": os.environ.get("SUPABASE_ANON_KEY",""),
+                    }
                     payload = {
                         "product_id": product_id,
                         "success": True,
-                        "generated_images": results,
-                        "auth_token": user_auth_token  # <-- pass user token along
+                        "generated_images": result["generated_images"],
                     }
+            
+                    import urllib.request, json
                     req = urllib.request.Request(
                         callback_url,
                         data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json"}
+                        headers=headers,
                     )
                     with urllib.request.urlopen(req, timeout=30) as resp:
-                        log.info("Callback -> %s status=%d", callback_url, resp.status)
-                except Exception as cb_err:
-                    log.error("Callback failed: %s", cb_err)
+                        body = resp.read().decode("utf-8", "ignore")
+                        log.info(f"Callback -> {callback_url} status={resp.status} body={body[:500]}")
+                except Exception as e:
+                    log.error(f"Callback failed: {e}")
 
             return send_json(self, 200, {"success": True, "generated_images": results})
 
