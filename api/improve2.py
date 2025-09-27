@@ -27,14 +27,22 @@ def send_json(self, code, obj):
 # Helpers
 # --------------------------------------------------------------------------
 def image_post_process(image_b64: str) -> str:
-    """Image post processing"""
-    img_bytes = base64.b64decode(image_b64)
-    # TODO: crop the image to 9:16 aspect ratio in center of the image
+    """Image post processing (force 24-bit RGB PNG)."""
+    # If the string has a data URL prefix, strip it
+    if image_b64.startswith("data:"):
+        _, b64data = image_b64.split(",", 1)
+    else:
+        b64data = image_b64
+
+    img_bytes = base64.b64decode(b64data)
     with Image.open(io.BytesIO(img_bytes)) as img:
-        rgb_img = img.convert("RGB")  # 24-bit
+        log.info(f"Pre-conversion mode: {img.mode}")  # <-- useful for debugging
+        rgb_img = img.convert("RGB")  # Force 24-bit
+        log.info(f"Post-conversion mode: {rgb_img.mode}")
         buf = io.BytesIO()
         rgb_img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
+
 
 
 DATA_URL_RE = re.compile(r"^data:(image/[^;]+);base64,(.+)$", re.IGNORECASE)
@@ -266,7 +274,7 @@ class handler(BaseHTTPRequestHandler):
                             img_b64_rgb = image_post_process(img_b64)
                         except Exception as conv_err:
                             log.warning(f"Failed to convert image to 24-bit: {conv_err}")
-                            img_b64_rgb = img_b64  # fallback
+                            img_b64_rgb = None
 
                         results.append({"prompt": p, "image": f"data:image/png;base64,{img_b64_rgb}"})
                     except Exception as e:
