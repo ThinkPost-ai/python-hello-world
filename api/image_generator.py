@@ -3,6 +3,9 @@ from http.server import BaseHTTPRequestHandler
 import os, json, base64, logging, sys, io, re
 from cgi import parse_header
 from openai import OpenAI
+from PIL import Image
+import io
+
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
 log = logging.getLogger("image_generator")
@@ -19,6 +22,24 @@ def send_json(self, code, obj):
     self.wfile.write(data)
 
 # --- helpers ---------------------------------------------------------------
+def image_post_process(image_b64: str) -> str:
+    # Decode base64 → bytes
+    img_bytes = base64.b64decode(image_b64)
+    
+    # Open with Pillow
+    with Image.open(io.BytesIO(img_bytes)) as img:
+        # Convert to 24-bit RGB
+        rgb_img = img.convert("RGB")
+        # TODO: crop the image to 9:16 aspect ratio in center of the image
+        # rgb_img = rgb_img.crop((0, 0, 1080, 1920))
+
+        
+        buf = io.BytesIO()
+        rgb_img.save(buf, format="PNG")  # keep PNG
+        rgb_bytes = buf.getvalue()
+    
+    # Encode back to base64
+    return base64.b64encode(rgb_bytes).decode("utf-8")
 
 DATA_URL_RE = re.compile(r"^data:(image/[^;]+);base64,(.+)$", re.IGNORECASE)
 
@@ -315,10 +336,18 @@ class handler(BaseHTTPRequestHandler):
             # Add generated images to result as array
             for key, image_b64 in generated_images.items():
                 if image_b64:
+                    try:
+                        # Force 24-bit RGB before returning
+                        image_b64_rgb = image_post_process(image_b64)
+                    except Exception as e:
+                        log.warning(f"Failed to convert image {key} to 24-bit: {e}")
+                        image_b64_rgb = image_b64  # fallback to original
+
                     result["generated_images"].append({
                         "prompt": prompts_json.get(key, ""),
-                        "image": f"data:image/png;base64,{image_b64}"
+                        "image": f"data:image/png;base64,{image_b64_rgb}"
                     })
+
 
             log.info(f"Successfully generated {len(result['generated_images'])} images")
             return send_json(self, 200, result)
