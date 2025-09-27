@@ -40,7 +40,7 @@ def image_post_process(image_b64: str) -> str:
         rgb_img = img.convert("RGB")  # Force 24-bit
         log.info(f"Post-conversion mode: {rgb_img.mode}")
         buf = io.BytesIO()
-        rgb_img.save(buf, format="PNG")
+        rgb_img.save(buf, format="JPEG")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -276,7 +276,7 @@ class handler(BaseHTTPRequestHandler):
                             log.warning(f"Failed to convert image to 24-bit: {conv_err}")
                             img_b64_rgb = None
 
-                        results.append({"prompt": p, "image": f"data:image/png;base64,{img_b64_rgb}"})
+                        results.append({"prompt": p, "image": f"data:image/jpeg;base64,{img_b64_rgb}"})
                     except Exception as e:
                         log.error("Image gen failed for a prompt: %s", e)
 
