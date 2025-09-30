@@ -39,8 +39,32 @@ def image_post_process(image_b64: str) -> str:
         log.info(f"Pre-conversion mode: {img.mode}")  # <-- useful for debugging
         rgb_img = img.convert("RGB")  # Force 24-bit
         log.info(f"Post-conversion mode: {rgb_img.mode}")
+        
+        # --- Crop to 9:16 aspect ratio (center crop) ---
+        img_w, img_h = rgb_img.size
+        target_ratio = 9 / 16
+        current_ratio = img_w / img_h
+
+        if current_ratio > target_ratio:
+            # Image is too wide → crop width
+            new_w = int(img_h * target_ratio)
+            left = (img_w - new_w) // 2
+            top = 0
+            right = left + new_w
+            bottom = img_h
+        else:
+            # Image is too tall → crop height
+            new_h = int(img_w / target_ratio)
+            left = 0
+            top = (img_h - new_h) // 2
+            right = img_w
+            bottom = top + new_h
+
+        cropped = rgb_img.crop((left, top, right, bottom))
+
+        # --- Save as JPEG ---
         buf = io.BytesIO()
-        rgb_img.save(buf, format="JPEG")
+        cropped.save(buf, format="JPEG")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
